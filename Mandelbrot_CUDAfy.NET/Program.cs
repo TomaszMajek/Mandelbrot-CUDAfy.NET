@@ -32,8 +32,7 @@ namespace Mandelbrot_CUDAfy.NET
             gpu.LoadModule(km);
 
 
-
-            // dane do GPU
+            // dane dla CPU/GPU
             const int pictureWidth = 2048, pictureHeight = 2048;
             double[,] bmArrayCPU = new double[pictureWidth, pictureHeight];
             double[] bmArrayGPU = new double[pictureWidth * pictureHeight];
@@ -47,6 +46,9 @@ namespace Mandelbrot_CUDAfy.NET
             // liczę czas wykonania metody/funkcji
             var watch_CPU = System.Diagnostics.Stopwatch.StartNew();
             mandelbrot_CPU(pictureWidth, pictureHeight, bmArrayCPU);
+            watch_CPU.Stop();
+            var elapsedMs_CPU = watch_CPU.ElapsedMilliseconds;
+
             for (int x = 0; x < pictureWidth; x++)
             {
                 for (int y = 0; y < pictureHeight; y++)
@@ -55,20 +57,20 @@ namespace Mandelbrot_CUDAfy.NET
                 }
             }
             bmCPU.Save("outputMandelbrot_CPU.jpg", ImageFormat.Jpeg);
-            watch_CPU.Stop();
-            var elapsedMs_CPU = watch_CPU.ElapsedMilliseconds;
             Console.WriteLine("-- -- --  -- -- --");
             Console.WriteLine("-- CPU: {0} ms --", elapsedMs_CPU);
             // CPU end
 
 
             // GPU starts
-            dim3 threadsPerBlock = new dim3(8, 8);
-            dim3 numBlocks = new dim3(pictureWidth / threadsPerBlock.x, pictureHeight / threadsPerBlock.y);
+            dim3 threadsPerBlock = new dim3(16, 16); // 256 wątków
+            dim3 numBlocks = new dim3(pictureWidth / threadsPerBlock.x, pictureHeight / threadsPerBlock.y); // (2048*2048)/256 = 16384 bloków // 2048/16 = 128 // 128x128 bloków
 
-            var watch_GPU = System.Diagnostics.Stopwatch.StartNew();
+            gpu.StartTimer();
             gpu.Launch(numBlocks, threadsPerBlock).mandelbrot_GPU(pictureWidth, pictureHeight, dev_bmArrayGPU);
             gpu.CopyFromDevice(dev_bmArrayGPU, bmArrayGPU);
+            int elapsedMs_GPU = (int)gpu.StopTimer();
+            gpu.FreeAll();
 
             for (int x = 0; x < pictureWidth; x++)
             {
@@ -78,8 +80,6 @@ namespace Mandelbrot_CUDAfy.NET
                 }
             }
             bmGPU.Save("outputMandelbrot_GPU.jpg", ImageFormat.Jpeg);
-            watch_GPU.Stop();
-            var elapsedMs_GPU = watch_GPU.ElapsedMilliseconds;
             Console.WriteLine("-- GPU: {0} ms --", elapsedMs_GPU);
             Console.WriteLine("-- -- --  -- -- --");
             // GPU end
@@ -90,31 +90,54 @@ namespace Mandelbrot_CUDAfy.NET
         }
 
 
-        
-        public static void mandelbrot_CPU(int width, int height, double[,] dev_bmArray)
+
+        // Jak działa algorytm?
+        //      każdemu pikselowi [row, column] przypisujemy pewną liczbę zespoloną
+        //      - Sprawdzamy czy należy do zbioru?
+        //      - TAK(black) / NIE(white)
+        //
+        public static void mandelbrot_CPU(int width, int height, double[,] bmArrayCPU)
         {
             int max = 1000;
             for (int row = 0; row < height; row++)
             {
                 for (int col = 0; col < width; col++)
                 {
-                    double c_re = (col - width / 2) * 4.0 / width;
-                    double c_im = (row - height / 2) * 4.0 / width;
-                    double x = 0, y = 0;
+                    // liczby zespolone można przedstawić jako liczby R (x, y)
+                    // jeśli zaczynamy od [0,0] to należy podzielić wysokość i szerokość na połowę
+                    // zbiór leży w promieniu 2 od środka, więc pełna szerokość wynosi 4
+                    //  (2,-2)     (2,2)
+                    //        (0,0)
+                    //  (-2,-2)   (-2,2)
+                    // skalujemy pozycję piksela, aby leżał w obszarze zbioru Mandelbrota
+                    double c_re = (col - width / 2) * 4.0 / width; // inne przybliżenia (-2.5, 1) 
+                    double c_im = (row - height / 2) * 4.0 / width;  // inne przybliżenia (-1, 1)   
+                    double x = 0, y = 0;    
                     int iterations = 0;
-                    while (x * x + y * y < 4 && iterations < max)
+                    while (x * x + y * y < 2 * 2 && iterations < max)
                     {
-                        double x_new = x * x - y * y + c_re;
+                        // z = x + iy
+                        // z^2 = x^2 + i2xy - y^2
+                        // c = x_0 + iy_0
+
+                        // c_re = x_0 | c_im = y_0
+                        
+                        // nie dajemy liczb "i" -->  x = Re(z^2 + c) = x^2 - y^2 + x_0
+                        // nie dajemy liczb "r" -->  y = Im(z^2 + c) = 2xy + y_0
+                        
+                        double x_temp = x * x - y * y + c_re;
                         y = 2 * x * y + c_im;
-                        x = x_new;
+                        x = x_temp;
                         iterations++;
                     }
-                    if (iterations < max) dev_bmArray[col, row] = 0;
-                    else dev_bmArray[col, row] = 1;
+                    if (iterations < max) bmArrayCPU[col, row] = 0;
+                    else bmArrayCPU[col, row] = 1;
                 }
             }
         }
 
+
+        // mamy kolejkę bloków (16384), które czekają na przypisanie do jednego z SM aby wykonać swoje 256 wątków
         [Cudafy]
         public static void mandelbrot_GPU(GThread thread, int width, int height, double[] dev_bmArray)
         {
@@ -126,17 +149,17 @@ namespace Mandelbrot_CUDAfy.NET
             double c_im = (thready - height / 2) * 4.0 / width;
             double x = 0, y = 0;
             int iterations = 0;
-            while (x * x + y * y < 4 && iterations < max)
+            while (x * x + y * y < 2 * 2 && iterations < max)
             {
-                double x_new = x * x - y * y + c_re;
+                double x_temp = x * x - y * y + c_re;
                 y = 2 * x * y + c_im;
-                x = x_new;
+                x = x_temp;
                 iterations++;
             }
             if (iterations < max) dev_bmArray[width * threadx + thready] = 0;
             else dev_bmArray[width * threadx + thready] = 1;
-
         }
+
 
         // WŁAŚCIWOŚCI GPU
         public static void PrintGpuProperties() // CUDAfy properties sample
